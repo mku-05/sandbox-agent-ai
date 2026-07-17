@@ -1,0 +1,10 @@
+# Never commit secrets — this repo only references the file, never contains it.
+*.env
+.secrets/
+agent-sandbox.env
+
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
