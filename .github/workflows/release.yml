@@ -1,0 +1,166 @@
+name: release
+
+# Cut a release by pushing a tag like v1.2.3:
+#   git tag v1.2.3 && git push origin v1.2.3
+#
+# This builds the self-contained artifact, attaches it to a GitHub Release,
+# and (when the relevant secret exists) publishes to npm and updates the
+# Homebrew tap. The npm and brew jobs skip gracefully if their secret is unset,
+# so the very first release works before you've configured either.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: meta
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build release artifact
+        id: build
+        run: |
+          bash scripts/build-release.sh "${{ steps.meta.outputs.version }}" dist
+          sha="$(awk '{print $1}' dist/agent-sandbox.sha256)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/agent-sandbox
+            dist/agent-sandbox.sha256
+          generate_release_notes: true
+
+      - name: Upload artifact for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-sandbox
+          path: dist/agent-sandbox
+
+  npm-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for npm token
+        id: gate
+        run: |
+          if [ -n "${{ secrets.NPM_TOKEN }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::NPM_TOKEN not set — skipping npm publish."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download artifact
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-sandbox
+          path: npm/bin
+
+      - name: Stage and publish package
+        if: steps.gate.outputs.enabled == 'true'
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          chmod +x bin/agent-sandbox
+          npm version "${{ needs.build.outputs.version }}" --no-git-tag-version --allow-same-version
+          npm publish --access public
+
+  homebrew-bump:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for tap token
+        id: gate
+        run: |
+          if [ -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HOMEBREW_TAP_TOKEN not set — skipping tap update."
+          fi
+
+      - name: Checkout tap repo
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: mku-05/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          mkdir -p tap/Formula
+          url="https://github.com/mku-05/sandbox-agent-ai/releases/download/v${VERSION}/agent-sandbox"
+          cat > tap/Formula/agent-sandbox.rb <<EOF
+          class AgentSandbox < Formula
+            desc "Run Claude Code, OpenAI Codex, or GitHub Copilot CLI in a locked-down Docker sandbox"
+            homepage "https://github.com/mku-05/sandbox-agent-ai"
+            version "${VERSION}"
+            url "${url}"
+            sha256 "${SHA256}"
+            license "MIT"
+
+            def install
+              bin.install "agent-sandbox"
+              bin.install_symlink "agent-sandbox" => "agent-sandbox.sh"
+            end
+
+            def caveats
+              <<~CAVEAT
+                agent-sandbox requires Docker on the host (the agent CLIs run inside the
+                container). If you don't have it:
+                  https://www.docker.com/
+              CAVEAT
+            end
+
+            test do
+              assert_match "agent-sandbox #{version}", shell_output("#{bin}/agent-sandbox --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        if: steps.gate.outputs.enabled == 'true'
+        working-directory: tap
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/agent-sandbox.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit."
+          else
+            git commit -m "agent-sandbox ${VERSION}"
+            git push
+          fi
