@@ -1,5 +1,5 @@
 {
-  "name": "@mku-05/agent-sandbox",
+  "name": "@mku0502/agent-sandbox",
   "version": "0.0.0",
   "description": "Run Claude Code, OpenAI Codex, or GitHub Copilot CLI inside a locked-down Docker sandbox.",
   "keywords": [

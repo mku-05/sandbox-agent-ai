@@ -1,4 +1,4 @@
-# @mku-05/agent-sandbox
+# @mku0502/agent-sandbox
 
 Run Claude Code, OpenAI Codex, or GitHub Copilot CLI inside a locked-down
 Docker container so an agent can do anything inside a chosen folder and nothing
@@ -10,7 +10,7 @@ else on your filesystem.
 ## Install
 
 ```bash
-npm i -g @mku-05/agent-sandbox
+npm i -g @mku0502/agent-sandbox
 ```
 
 ## Usage
