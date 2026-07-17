@@ -29,7 +29,7 @@ VERSION="dev"
 
 IMAGE="agent-sandbox:latest"
 INSTALL_URL="https://raw.githubusercontent.com/mku-05/sandbox-agent-ai/main/install.sh"
-NPM_PKG="@mku-05/agent-sandbox"
+NPM_PKG="@mku0502/agent-sandbox"
 
 # --- Resolve this script's real path (following symlinks) so the dev-mode
 #     Dockerfile fallback can find its sibling Dockerfile and --uninstall can

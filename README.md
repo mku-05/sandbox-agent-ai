@@ -44,7 +44,7 @@ brew install mku-05/tap/agent-sandbox
 curl -fsSL https://raw.githubusercontent.com/mku-05/sandbox-agent-ai/main/install.sh | bash
 
 # npm (if you already have Node on the host)
-npm i -g @mku-05/agent-sandbox
+npm i -g @mku0502/agent-sandbox
 ```
 
 Then verify and run:
@@ -75,7 +75,7 @@ The curl installer honors `AGENT_SANDBOX_INSTALL_DIR` (install location) and
 - `scripts/build-release.sh` — stamps the version and embeds the Dockerfile to
   produce the single self-contained `agent-sandbox` artifact all channels ship.
 - `Formula/agent-sandbox.rb` — Homebrew formula (source of truth for the tap).
-- `npm/` — npm package (`@mku-05/agent-sandbox`) metadata.
+- `npm/` — npm package (`@mku0502/agent-sandbox`) metadata.
 - `.github/workflows/release.yml` — on a `v*` tag: build → GitHub Release →
   npm publish → Homebrew tap bump.
 - `README.md` — this file.
@@ -235,7 +235,7 @@ bumps the Homebrew tap.
 2. **Add two Actions secrets** to `mku-05/sandbox-agent-ai`
    (Settings → Secrets and variables → Actions):
    - `NPM_TOKEN` — an npm **automation** token with publish rights to the
-     `@mku-05` scope.
+     `@mku0502` scope.
    - `HOMEBREW_TAP_TOKEN` — a fine-grained PAT with **contents: write** on
      `mku-05/homebrew-tap`.
 
