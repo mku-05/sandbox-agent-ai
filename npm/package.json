@@ -1,0 +1,34 @@
+{
+  "name": "@mku-05/agent-sandbox",
+  "version": "0.0.0",
+  "description": "Run Claude Code, OpenAI Codex, or GitHub Copilot CLI inside a locked-down Docker sandbox.",
+  "keywords": [
+    "docker",
+    "sandbox",
+    "claude",
+    "codex",
+    "copilot",
+    "coding-agent",
+    "security"
+  ],
+  "homepage": "https://github.com/mku-05/sandbox-agent-ai#readme",
+  "bugs": {
+    "url": "https://github.com/mku-05/sandbox-agent-ai/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mku-05/sandbox-agent-ai.git"
+  },
+  "license": "MIT",
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "bin": {
+    "agent-sandbox": "bin/agent-sandbox"
+  },
+  "files": [
+    "bin/agent-sandbox",
+    "README.md"
+  ]
+}
