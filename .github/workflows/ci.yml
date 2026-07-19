@@ -1,0 +1,73 @@
+name: ci
+
+# Runs on every push and PR. Mirrors the "Verify before you commit" checks in
+# AGENTS.md so the invariants are enforced mechanically, not just by convention.
+# There is no unit-test suite — verification is exercising the real scripts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: bash -n agent-sandbox.sh install.sh scripts/build-release.sh
+
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "."
+          # Match how the scripts are actually invoked (bash, not sh).
+          additional_files: "agent-sandbox.sh install.sh"
+
+      - name: Homebrew formula parses
+        run: ruby -c Formula/agent-sandbox.rb
+
+      - name: Release workflow YAML is valid
+        run: ruby -ryaml -e "YAML.load_file('.github/workflows/release.yml')"
+
+      - name: CI workflow YAML is valid
+        run: ruby -ryaml -e "YAML.load_file('.github/workflows/ci.yml')"
+
+      - name: npm package.json is valid
+        run: ruby -rjson -e "JSON.parse(File.read('npm/package.json'))"
+
+      - name: Scripts are executable (mode 100755)
+        run: |
+          fail=0
+          for f in agent-sandbox.sh install.sh scripts/build-release.sh; do
+            mode="$(git ls-files -s "$f" | awk '{print $1}')"
+            if [ "$mode" != "100755" ]; then
+              echo "::error file=$f::expected mode 100755, got $mode"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Build artifact and check invariants
+        run: |
+          bash scripts/build-release.sh 0.0.0 dist
+          # 1. valid bash
+          bash -n dist/agent-sandbox
+          # 2. placeholder fully replaced
+          if grep -q '@@EMBEDDED_DOCKERFILE@@' dist/agent-sandbox; then
+            echo "::error::embedded-Dockerfile placeholder still present in artifact"
+            exit 1
+          fi
+          # 3. version stamped
+          bash dist/agent-sandbox --version | grep -q '0.0.0'
+
+      - name: Embedded Dockerfile builds
+        run: |
+          # Reproduce exactly what the installed tool pipes to `docker build`.
+          EMBEDDED_DOCKERFILE=1 SCRIPT_DIR=/nonexistent \
+            bash -c "$(sed -n '/^emit_dockerfile()/,/^}/p' dist/agent-sandbox); emit_dockerfile" \
+            | docker build --check -
