@@ -351,7 +351,7 @@ build_allow_list() {
 }
 
 cleanup_net() {
-  [ "$PROXY_STARTED" = "1" ] || { [ -n "$PROXY_TMP" ] && rm -rf "$PROXY_TMP"; return; }
+  [ "$PROXY_STARTED" = "1" ] || { [ -n "$PROXY_TMP" ] && rm -rf "$PROXY_TMP" || true; return; }
   docker rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
   docker network rm "$NET_NAME" >/dev/null 2>&1 || true
   [ -n "$PROXY_TMP" ] && rm -rf "$PROXY_TMP"
