@@ -11,9 +11,10 @@ Docker container so an agent can do **anything inside a chosen folder** and
 
 ## What this actually protects (read this first)
 
-A container isolates the **filesystem** and **scopes your credentials**. It does
-**not** isolate the **network** — these agents *must* reach Bedrock / OpenAI /
-GitHub to work, so outbound network is open by design.
+A container isolates the **filesystem** and **scopes your credentials**. By
+default it does **not** isolate the **network** — these agents *must* reach
+Bedrock / OpenAI / GitHub to work, so outbound network is open unless you opt
+into `--net=allowlist` (see [Network egress control](#network-egress-control)).
 
 So the honest threat model is:
 
@@ -24,11 +25,12 @@ So the honest threat model is:
 | Privilege escalation inside the container | ✅ Mostly | `--cap-drop=ALL`, `--security-opt=no-new-privileges` |
 | Fork bombs / memory blowups | ✅ Bounded | `--pids-limit`, `--memory` |
 | Secrets leaking from your shell env | ✅ Yes | Secrets come from a file, never `~/.zshrc` |
-| Agent reading/exfiltrating data over the network | ❌ **No** | Network is open; it has to be |
+| Agent reading/exfiltrating data over the network | ⚠️ Optional | Open by default; **`--net=allowlist`** limits egress to known hosts, `--net=none` blocks it entirely |
 | Agent reading your AWS creds (claude only) | ⚠️ Partial | Mounted read-only; use **short-lived SSO creds** |
 
-If you rely on this to stop an agent from *touching your cloud*, it won't —
-scope your credentials (below) instead.
+With the default `--net=open`, if you rely on this to stop an agent from
+*touching your cloud*, it won't — either scope your credentials (below) or run
+with `--net=allowlist`.
 
 ## Install
 
@@ -129,10 +131,93 @@ agent-sandbox copilot /path/to/project
 
 # folder defaults to the current directory:
 cd /path/to/project && agent-sandbox claude
+
+# restrict what the agent can reach on the network (see below):
+agent-sandbox claude /path/to/project --net=allowlist
+
+# print the exact docker command without launching anything:
+agent-sandbox claude /path/to/project --dry-run
 ```
 
 The agent starts with `/workspace` = your project folder and can freely read,
 write, and run commands there.
+
+### Agents run with full access inside the sandbox
+
+**The container is the boundary, so the agent doesn't second-guess you.** Each
+agent is launched with its own in-app guardrails turned off — no per-command
+approval prompts — because the sandbox (filesystem scope, dropped capabilities,
+and optional egress allowlist) is what actually confines it. That's the whole
+point: let the agent work uninterrupted *because* it can't escape the box.
+
+| Agent | Launched with |
+|---|---|
+| `claude` | `--dangerously-skip-permissions` |
+| `codex` | `--dangerously-bypass-approvals-and-sandbox` |
+| `copilot` | `--allow-all-tools` |
+
+> ⚠️ These flags are only appropriate **because** the agent is boxed in. Don't
+> copy them into an un-sandboxed agent on your host.
+
+Each is overridable via an environment variable (vendors rename these flags from
+time to time). Set it to a different flag, or to empty to fall back to the
+agent's default cautious mode:
+
+```bash
+# Run Claude in its normal prompt-for-permission mode instead:
+AGENT_SANDBOX_CLAUDE_ARGS="" agent-sandbox claude /path/to/project
+
+# Override the flag if a vendor renames it:
+AGENT_SANDBOX_CODEX_ARGS="--full-auto" agent-sandbox codex /path/to/project
+```
+
+The variables are `AGENT_SANDBOX_CLAUDE_ARGS`, `AGENT_SANDBOX_CODEX_ARGS`, and
+`AGENT_SANDBOX_COPILOT_ARGS`. Use `--dry-run` to see exactly what gets passed.
+
+## Network egress control
+
+By default the sandbox scopes your **filesystem and credentials** but leaves
+**outbound network open** — the agents need to reach their backends. If your
+worry is an agent (or a compromised dependency it pulls in) *exfiltrating* your
+code or secrets, restrict egress:
+
+```bash
+# Only let the agent reach a known set of hosts (model backends, GitHub, npm):
+agent-sandbox claude /path/to/project --net=allowlist
+
+# Allow an extra host on top of the defaults (repeatable):
+agent-sandbox claude /path/to/project --net=allowlist --allow=internal.corp.example
+
+# Fully offline — no network at all:
+agent-sandbox codex /path/to/project --net=none
+```
+
+**How allowlist mode works.** The agent container joins an `--internal` Docker
+network with **no route to the internet**. Its only way out is a small
+[`tinyproxy`](https://tinyproxy.github.io/) sidecar (built from this same pinned
+image — no extra download) that filters HTTPS `CONNECT` by hostname against the
+allowlist and denies everything else. It's a *destination* filter: there's no
+TLS interception, so the proxy never sees your traffic, only where it's headed.
+Ports other than 443 are refused.
+
+The default allowlist covers what a coding agent legitimately needs — Anthropic
+/ Bedrock (`anthropic.com`, `amazonaws.com`), OpenAI (`openai.com`), GitHub +
+Copilot (`github.com`, `githubusercontent.com`, `githubcopilot.com`, …), and the
+npm registry (`npmjs.org`, `npmjs.com`, `nodejs.org`). Extend it without editing
+anything via `--allow=<domain>` (repeatable) or the `AGENT_SANDBOX_ALLOW`
+environment variable (space- or comma-separated). Matching is by domain suffix,
+so `anthropic.com` also permits `api.anthropic.com`.
+
+> If an agent suddenly can't reach a service in allowlist mode, its domain
+> almost certainly isn't listed — add it with `--allow=`.
+
+**See exactly what will run, first.** `--dry-run` prints the precise
+`docker`/proxy commands (and the resolved allowlist) without launching anything
+— it doesn't even require Docker to be installed:
+
+```bash
+agent-sandbox claude /path/to/project --net=allowlist --dry-run
+```
 
 ## AWS / Bedrock credentials
 

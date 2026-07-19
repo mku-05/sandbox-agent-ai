@@ -31,6 +31,35 @@ IMAGE="agent-sandbox:latest"
 INSTALL_URL="https://raw.githubusercontent.com/mku-05/sandbox-agent-ai/main/install.sh"
 NPM_PKG="@mku0502/agent-sandbox"
 
+# --- Egress allowlist (used only with --net=allowlist) ------------------------
+# The default set of domains a coding agent legitimately needs to reach: the
+# model backends (Bedrock/Anthropic/OpenAI), GitHub (+ Copilot), and the npm
+# registry (agents install/run packages). Everything else is denied, which is
+# what turns "agent can exfiltrate over the network" from YES into "only to
+# these hosts". Matched as a suffix against the CONNECT host, case-insensitively
+# (e.g. "anthropic.com" also allows "api.anthropic.com").
+#
+# Add to this without editing the script via AGENT_SANDBOX_ALLOW (space- or
+# comma-separated) or one/more --allow=<domain> flags. Tune it for your setup;
+# an agent that suddenly can't reach a service in allowlist mode almost always
+# means that service's domain isn't listed here.
+DEFAULT_ALLOW_DOMAINS=(
+  # Anthropic / Claude (direct API and Bedrock)
+  anthropic.com
+  amazonaws.com
+  # OpenAI / Codex
+  openai.com
+  # GitHub / Copilot
+  github.com
+  githubusercontent.com
+  githubcopilot.com
+  githubassets.com
+  # npm registry (agents install and run packages)
+  npmjs.org
+  npmjs.com
+  nodejs.org
+)
+
 # --- Resolve this script's real path (following symlinks) so the dev-mode
 #     Dockerfile fallback can find its sibling Dockerfile and --uninstall can
 #     find the actual installed file rather than a symlink to it. ---
@@ -83,7 +112,7 @@ usage() {
 agent-sandbox $VERSION — run a coding agent in a locked-down Docker sandbox.
 
 Usage:
-  agent-sandbox <claude|codex|copilot> [/path/to/folder]
+  agent-sandbox <claude|codex|copilot> [/path/to/folder] [options]
   agent-sandbox --version
   agent-sandbox --update
   agent-sandbox --uninstall
@@ -91,6 +120,19 @@ Usage:
 
 The folder defaults to the current directory. The agent gets full read/write
 to that one folder (mounted at /workspace) and nothing else on your host.
+
+Options:
+  --net=<mode>     Network egress policy. One of:
+                     open       (default) unrestricted outbound — today's behavior
+                     allowlist  only reach an allowlisted set of domains, via a
+                                CONNECT-filtering proxy sidecar. Flips the
+                                "agent can exfiltrate over the network" risk from
+                                YES to "only to allowed hosts".
+                     none       no network at all (fully offline)
+  --allow=<domain> Add a domain to the allowlist (repeatable). Implies
+                   --net=allowlist. Also settable via AGENT_SANDBOX_ALLOW.
+  --dry-run        Print the docker command(s) that would run, then exit.
+                   Nothing is launched. Great for auditing the isolation.
 EOF
 }
 
@@ -162,11 +204,42 @@ case "${1:-}" in
   "")                  usage >&2; exit 1 ;;
 esac
 
-AGENT="$1"
-RAW_FOLDER="${2:-$(pwd)}"
+# --- Parse the agent, an optional folder, and flags. The agent is the first
+#     non-flag arg; the folder is the second non-flag arg (defaults to $PWD).
+#     Flags may appear in any position. ---
+AGENT=""
+RAW_FOLDER=""
+NET_MODE="open"
+DRY_RUN=0
+EXTRA_ALLOW=()
 
-# --- Docker is required for everything past this point. ---
-if ! command -v docker >/dev/null 2>&1; then
+for arg in "$@"; do
+  case "$arg" in
+    --net=*)   NET_MODE="${arg#*=}" ;;
+    --allow=*) EXTRA_ALLOW+=("${arg#*=}"); [ "$NET_MODE" = "open" ] && NET_MODE="allowlist" ;;
+    --dry-run) DRY_RUN=1 ;;
+    --*)       echo "agent-sandbox: unknown option '$arg' (see --help)" >&2; exit 1 ;;
+    *)
+      if [ -z "$AGENT" ]; then AGENT="$arg"
+      elif [ -z "$RAW_FOLDER" ]; then RAW_FOLDER="$arg"
+      else echo "agent-sandbox: unexpected argument '$arg' (see --help)" >&2; exit 1
+      fi
+      ;;
+  esac
+done
+
+if [ -z "$AGENT" ]; then usage >&2; exit 1; fi
+RAW_FOLDER="${RAW_FOLDER:-$(pwd)}"
+
+case "$NET_MODE" in
+  open|allowlist|none) ;;
+  *) echo "agent-sandbox: invalid --net='$NET_MODE' (use open, allowlist, or none)" >&2; exit 1 ;;
+esac
+
+# --- Docker is required to actually launch. In --dry-run we only print the
+#     plan, so we don't insist on Docker being present — you can audit the
+#     isolation on any machine. ---
+if ! command -v docker >/dev/null 2>&1 && [ "$DRY_RUN" != "1" ]; then
   echo "agent-sandbox: Docker is required but was not found on PATH." >&2
   echo "               Install Docker Desktop or engine: https://www.docker.com/" >&2
   exit 1
@@ -190,15 +263,15 @@ esac
 
 # --- Secrets file (Docker --env-file format: KEY=value, no 'export', no quotes). ---
 SECRETS_FILE="$HOME/.secrets/agent-sandbox.env"
-if [ ! -f "$SECRETS_FILE" ]; then
+if [ ! -f "$SECRETS_FILE" ] && [ "$DRY_RUN" != "1" ]; then
   echo "No secrets file at $SECRETS_FILE — creating an empty one (chmod 600)."
   mkdir -p "$(dirname "$SECRETS_FILE")"
   touch "$SECRETS_FILE"
   chmod 600 "$SECRETS_FILE"
 fi
 
-# --- Build the image on first use. ---
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+# --- Build the image on first use. Skipped in --dry-run (nothing launches). ---
+if [ "$DRY_RUN" != "1" ] && ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   build_image
 fi
 
@@ -249,25 +322,165 @@ COMMON_ARGS=(
   --memory=4g
 )
 
+# --- Network mode wiring --------------------------------------------------
+# open       (default): nothing extra — the container gets Docker's normal
+#            bridge with unrestricted egress. Byte-for-byte the old behavior.
+# none       : --network none. Fully offline.
+# allowlist  : the agent joins an *internal* network (no NAT to the internet)
+#            and reaches the outside world ONLY through a tinyproxy sidecar that
+#            filters HTTPS CONNECT by hostname against the allowlist. No TLS
+#            interception — the proxy can't read traffic, only gate its
+#            destination. This is what closes the exfiltration hole.
+NET_ARGS=()          # docker run args added to the agent container
+PROXY_STARTED=0      # for cleanup
+NET_NAME=""
+PROXY_NAME=""
+PROXY_TMP=""
+
+# Assemble the effective allowlist: defaults + AGENT_SANDBOX_ALLOW + --allow.
+build_allow_list() {
+  local d out=()
+  out+=("${DEFAULT_ALLOW_DOMAINS[@]}")
+  # AGENT_SANDBOX_ALLOW is space- or comma-separated.
+  if [ -n "${AGENT_SANDBOX_ALLOW:-}" ]; then
+    local IFS=', '
+    for d in $AGENT_SANDBOX_ALLOW; do [ -n "$d" ] && out+=("$d"); done
+  fi
+  out+=("${EXTRA_ALLOW[@]}")
+  printf '%s\n' "${out[@]}" | awk 'NF && !seen[$0]++'
+}
+
+cleanup_net() {
+  [ "$PROXY_STARTED" = "1" ] || { [ -n "$PROXY_TMP" ] && rm -rf "$PROXY_TMP" || true; return; }
+  docker rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
+  docker network rm "$NET_NAME" >/dev/null 2>&1 || true
+  [ -n "$PROXY_TMP" ] && rm -rf "$PROXY_TMP"
+}
+
+# Generate the tinyproxy config + filter, spin up the sidecar, and set the
+# agent's NET_ARGS to route through it. In --dry-run we only print the plan.
+setup_allowlist_net() {
+  local suffix="$$"
+  NET_NAME="agent-sandbox-net-${suffix}"
+  PROXY_NAME="agent-sandbox-proxy-${suffix}"
+  PROXY_TMP="$(mktemp -d)"
+
+  # Filter file: one extended-regex per allowed domain, anchored so
+  # "anthropic.com" matches the domain and its subdomains but not
+  # "evil-anthropic.com.attacker.net". tinyproxy denies by default.
+  local d
+  : > "$PROXY_TMP/filter"
+  while IFS= read -r d; do
+    # (^|\.)example\.com$  — escape dots.
+    printf '(^|\\.)%s$\n' "$(printf '%s' "$d" | sed 's/\./\\./g')" >> "$PROXY_TMP/filter"
+  done < <(build_allow_list)
+
+  # PidFile/logging go to /tmp because the proxy runs as non-root `node` and
+  # /etc/asbx is mounted read-only. With `-d` tinyproxy also logs to the
+  # foreground, which `docker logs $PROXY_NAME` will show.
+  cat > "$PROXY_TMP/tinyproxy.conf" <<EOF
+Port 8888
+Timeout 600
+LogLevel Info
+PidFile "/tmp/tinyproxy.pid"
+# Which client IPs may use the proxy. The agent is the only thing on the
+# internal network, so allow all clients; real egress control is the Filter
+# below, not client ACLs.
+Allow 0.0.0.0/0
+# Only tunnel HTTPS to 443 (block CONNECT to arbitrary ports).
+ConnectPort 443
+# Deny every host except those matching the filter regexes.
+FilterDefaultDeny Yes
+FilterExtended Yes
+FilterCaseSensitive No
+Filter "/etc/asbx/filter"
+EOF
+
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "# allowlist mode — would create an internal network and a filtering proxy:"
+    echo "docker network create --internal $NET_NAME"
+    echo "docker run -d --name $PROXY_NAME --network $NET_NAME \\"
+    echo "  -v $PROXY_TMP:/etc/asbx:ro --cap-drop=ALL --security-opt=no-new-privileges \\"
+    echo "  $IMAGE tinyproxy -d -c /etc/asbx/tinyproxy.conf"
+    echo "docker network connect bridge $PROXY_NAME   # give the proxy (only) egress"
+    echo "# allowed domains:"; build_allow_list | sed 's/^/#   /'
+  else
+    docker network create --internal "$NET_NAME" >/dev/null
+    # Proxy joins the internal net (to serve the agent). It runs from OUR pinned
+    # image, so no extra supply-chain surface.
+    docker run -d --name "$PROXY_NAME" --network "$NET_NAME" \
+      -v "$PROXY_TMP":/etc/asbx:ro \
+      --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=64 --memory=256m \
+      "$IMAGE" tinyproxy -d -c /etc/asbx/tinyproxy.conf >/dev/null
+    PROXY_STARTED=1
+    # Give the proxy — and only the proxy — a route to the internet.
+    docker network connect bridge "$PROXY_NAME" >/dev/null
+    echo "Network: allowlist mode (egress limited to $(build_allow_list | wc -l | tr -d ' ') domains via proxy)." >&2
+  fi
+
+  # Route the agent's HTTP(S) through the proxy. Docker's embedded DNS on the
+  # user-defined network resolves the proxy container name.
+  NET_ARGS=(
+    --network "$NET_NAME"
+    -e "HTTPS_PROXY=http://${PROXY_NAME}:8888"
+    -e "HTTP_PROXY=http://${PROXY_NAME}:8888"
+    -e "https_proxy=http://${PROXY_NAME}:8888"
+    -e "http_proxy=http://${PROXY_NAME}:8888"
+    -e "NO_PROXY=localhost,127.0.0.1"
+    -e "no_proxy=localhost,127.0.0.1"
+  )
+}
+
+# Register cleanup BEFORE setup so a mid-setup failure (under `set -e`) still
+# tears down any partially-created network/proxy/temp dir.
+trap cleanup_net EXIT
+
+case "$NET_MODE" in
+  open)      : ;;                       # no extra args
+  none)      NET_ARGS=(--network none) ;;
+  allowlist) setup_allowlist_net ;;
+esac
+
+# --- Assemble the agent-specific args and launch (or print). ---
+#
+# AGENT_ARGS   -> extra `docker run` flags (mounts/env) for this agent.
+# AGENT_CMD_ARGS -> flags passed to the AGENT CLI itself, after its name.
+#
+# The container IS the security boundary — full filesystem/credential/(optional)
+# network containment already applies. So inside it we run each agent with its
+# own in-app guardrails OFF: no per-command approval prompts, since the sandbox,
+# not the agent, is what confines it. Each agent's "full access" flag has been
+# renamed by its vendor before, so it's overridable via an env var (set it to
+# empty to launch the agent in its default cautious mode instead).
+AGENT_ARGS=()
+AGENT_CMD_ARGS=()
 case "$AGENT" in
   claude)
     # Bedrock needs AWS creds. Mount them read-only and ONLY for claude.
     # Prefer short-lived SSO creds over long-lived keys in ~/.aws/credentials.
-    docker run "${COMMON_ARGS[@]}" \
-      -v "$HOME/.aws":/home/node/.aws:ro \
-      -e AWS_PROFILE="${AWS_PROFILE:-default}" \
-      -e AWS_REGION="${AWS_REGION:-us-east-1}" \
-      -e CLAUDE_CODE_USE_BEDROCK=1 \
-      "$IMAGE" claude
-    ;;
-  copilot)
-    docker run "${COMMON_ARGS[@]}" "$IMAGE" copilot
+    AGENT_ARGS=(
+      -v "$HOME/.aws":/home/node/.aws:ro
+      -e AWS_PROFILE="${AWS_PROFILE:-default}"
+      -e AWS_REGION="${AWS_REGION:-us-east-1}"
+      -e CLAUDE_CODE_USE_BEDROCK=1
+    )
+    read -r -a AGENT_CMD_ARGS <<< "${AGENT_SANDBOX_CLAUDE_ARGS---dangerously-skip-permissions}"
     ;;
   codex)
-    docker run "${COMMON_ARGS[@]}" "$IMAGE" codex
+    read -r -a AGENT_CMD_ARGS <<< "${AGENT_SANDBOX_CODEX_ARGS---dangerously-bypass-approvals-and-sandbox}"
+    ;;
+  copilot)
+    read -r -a AGENT_CMD_ARGS <<< "${AGENT_SANDBOX_COPILOT_ARGS---allow-all-tools}"
     ;;
   *)
     echo "Unknown agent: '$AGENT' (use claude, copilot, or codex)" >&2
     exit 1
     ;;
 esac
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "docker run ${COMMON_ARGS[*]} ${NET_ARGS[*]} ${AGENT_ARGS[*]} $IMAGE $AGENT ${AGENT_CMD_ARGS[*]}"
+  exit 0
+fi
+
+docker run "${COMMON_ARGS[@]}" "${NET_ARGS[@]}" "${AGENT_ARGS[@]}" "$IMAGE" "$AGENT" "${AGENT_CMD_ARGS[@]}"
